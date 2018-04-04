@@ -1,5 +1,5 @@
 // Copyright (C) 2017 Michał Matczuk
-// Use of this source code is governed by a BSD-style
+// Use of this source code is governed by an AGPL-style
 // license that can be found in the LICENSE file.
 
 package main
@@ -23,12 +23,11 @@ Commands:
 
 Examples:
 	tunnel start www ssh
-	tunnel -config config.yaml -log stdout -log-level 2 start ssh
+	tunnel -config config.yaml -log-level 2 start ssh
 	tunnel start-all
 
 config.yaml:
-	server_addr: SERVER_IP:4443
-	insecure_skip_verify: true
+	server_addr: SERVER_IP:5223
 	tunnels:
 	  webui:
 	    proto: http
@@ -56,9 +55,7 @@ func init() {
 }
 
 type options struct {
-	debug    bool
 	config   string
-	logTo    string
 	logLevel int
 	version  bool
 	command  string
@@ -66,17 +63,13 @@ type options struct {
 }
 
 func parseArgs() (*options, error) {
-	debug := flag.Bool("debug", false, "Starts gops agent")
 	config := flag.String("config", "tunnel.yml", "Path to tunnel configuration file")
-	logTo := flag.String("log", "stdout", "Write log messages to this file, file name or 'stdout', 'stderr', 'none'")
 	logLevel := flag.Int("log-level", 1, "Level of messages to log, 0-3")
 	version := flag.Bool("version", false, "Prints tunnel version")
 	flag.Parse()
 
 	opts := &options{
-		debug:    *debug,
 		config:   *config,
-		logTo:    *logTo,
 		logLevel: *logLevel,
 		version:  *version,
 		command:  flag.Arg(0),

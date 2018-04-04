@@ -1,11 +1,11 @@
-### Release
-build
+### Tunnel
+.tunnel/
+build/
 
 ### Go
 *.cov
 *.prof
 *.mprof
-vendor
 
 ### IntelliJ
 .idea/

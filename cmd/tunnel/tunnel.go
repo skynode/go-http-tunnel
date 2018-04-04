@@ -1,5 +1,5 @@
 // Copyright (C) 2017 Michał Matczuk
-// Use of this source code is governed by a BSD-style
+// Use of this source code is governed by an AGPL-style
 // license that can be found in the LICENSE file.
 
 package main
@@ -8,6 +8,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io/ioutil"
+	"net"
 	"net/url"
 	"os"
 	"sort"
@@ -32,13 +34,10 @@ func main() {
 		return
 	}
 
-	logger, err := log.NewLogger(opts.logTo, opts.logLevel)
-	if err != nil {
-		fatal("failed to init logger: %s", err)
-	}
+	logger := log.NewFilterLogger(log.NewStdLogger(), opts.logLevel)
 
 	// read configuration file
-	config, err := loadConfiguration(opts.config)
+	config, err := loadClientConfigFromFile(opts.config)
 	if err != nil {
 		fatal("configuration error: %s", err)
 	}
@@ -70,7 +69,7 @@ func main() {
 
 		return
 	case "start":
-		tunnels := make(map[string]*tunnelConfig)
+		tunnels := make(map[string]*Tunnel)
 		for _, arg := range opts.args {
 			t, ok := config.Tunnels[arg]
 			if !ok {
@@ -81,49 +80,80 @@ func main() {
 		config.Tunnels = tunnels
 	}
 
-	cert, err := tls.LoadX509KeyPair(config.TLSCrt, config.TLSKey)
+	if len(config.Tunnels) == 0 {
+		fatal("no tunnels")
+	}
+
+	tlsconf, err := tlsConfig(config)
 	if err != nil {
-		fatal("failed to load certificate: %s", err)
+		fatal("failed to configure tls: %s", err)
 	}
 
 	b, err := yaml.Marshal(config)
 	if err != nil {
-		fatal("failed to load config: %s", err)
+		fatal("failed to dump config: %s", err)
 	}
 	logger.Log("config", string(b))
 
-	client := tunnel.NewClient(&tunnel.ClientConfig{
+	client, err := tunnel.NewClient(&tunnel.ClientConfig{
 		ServerAddr:      config.ServerAddr,
-		TLSClientConfig: tlsConfig(cert, config),
+		TLSClientConfig: tlsconf,
 		Backoff:         expBackoff(config.Backoff),
 		Tunnels:         tunnels(config.Tunnels),
 		Proxy:           proxy(config.Tunnels, logger),
 		Logger:          logger,
 	})
+	if err != nil {
+		fatal("failed to create client: %s", err)
+	}
 
 	if err := client.Start(); err != nil {
-		fatal("%s", err)
+		fatal("failed to start tunnels: %s", err)
 	}
 }
 
-func tlsConfig(cert tls.Certificate, config *config) *tls.Config {
+func tlsConfig(config *ClientConfig) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(config.TLSCrt, config.TLSKey)
+	if err != nil {
+		return nil, err
+	}
+
+	var roots *x509.CertPool
+	if config.RootCA != "" {
+		roots = x509.NewCertPool()
+		rootPEM, err := ioutil.ReadFile(config.RootCA)
+		if err != nil {
+			return nil, err
+		}
+		if ok := roots.AppendCertsFromPEM(rootPEM); !ok {
+			return nil, err
+		}
+	}
+
+	host, _, err := net.SplitHostPort(config.ServerAddr)
+	if err != nil {
+		return nil, err
+	}
+
 	return &tls.Config{
+		ServerName:         host,
 		Certificates:       []tls.Certificate{cert},
-		InsecureSkipVerify: config.InsecureSkipVerify,
-	}
+		InsecureSkipVerify: roots == nil,
+		RootCAs:            roots,
+	}, nil
 }
 
-func expBackoff(config *backoffConfig) *backoff.ExponentialBackOff {
+func expBackoff(c BackoffConfig) *backoff.ExponentialBackOff {
 	b := backoff.NewExponentialBackOff()
-	b.InitialInterval = config.InitialInterval
-	b.Multiplier = config.Multiplier
-	b.MaxInterval = config.MaxInterval
-	b.MaxElapsedTime = config.MaxElapsedTime
+	b.InitialInterval = c.Interval
+	b.Multiplier = c.Multiplier
+	b.MaxInterval = c.MaxInterval
+	b.MaxElapsedTime = c.MaxTime
 
 	return b
 }
 
-func tunnels(m map[string]*tunnelConfig) map[string]*proto.Tunnel {
+func tunnels(m map[string]*Tunnel) map[string]*proto.Tunnel {
 	p := make(map[string]*proto.Tunnel)
 
 	for name, t := range m {
@@ -138,7 +168,7 @@ func tunnels(m map[string]*tunnelConfig) map[string]*proto.Tunnel {
 	return p
 }
 
-func proxy(m map[string]*tunnelConfig, logger log.Logger) tunnel.ProxyFunc {
+func proxy(m map[string]*Tunnel, logger log.Logger) tunnel.ProxyFunc {
 	httpURL := make(map[string]*url.URL)
 	tcpAddr := make(map[string]string)
 

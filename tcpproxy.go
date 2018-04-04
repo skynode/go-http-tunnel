@@ -1,5 +1,5 @@
 // Copyright (C) 2017 Michał Matczuk
-// Use of this source code is governed by a BSD-style
+// Use of this source code is governed by an AGPL-style
 // license that can be found in the LICENSE file.
 
 package tunnel
@@ -17,7 +17,7 @@ import (
 type TCPProxy struct {
 	// localAddr specifies default TCP address of the local server.
 	localAddr string
-	// localAddrMap specifies mapping from ControlMessage ForwardedBy to
+	// localAddrMap specifies mapping from ControlMessage.ForwardedHost to
 	// local server address, keys may contain host and port, only host or
 	// only port. The order of precedence is the following
 	// * host and port
@@ -31,10 +31,6 @@ type TCPProxy struct {
 // NewTCPProxy creates new direct TCPProxy, everything will be proxied to
 // localAddr.
 func NewTCPProxy(localAddr string, logger log.Logger) *TCPProxy {
-	if localAddr == "" {
-		panic("missing localAddr")
-	}
-
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -48,10 +44,6 @@ func NewTCPProxy(localAddr string, logger log.Logger) *TCPProxy {
 // NewMultiTCPProxy creates a new dispatching TCPProxy, connections may go to
 // different backends based on localAddrMap.
 func NewMultiTCPProxy(localAddrMap map[string]string, logger log.Logger) *TCPProxy {
-	if localAddrMap == nil {
-		panic("missing localAddrMap")
-	}
-
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -64,8 +56,8 @@ func NewMultiTCPProxy(localAddrMap map[string]string, logger log.Logger) *TCPPro
 
 // Proxy is a ProxyFunc.
 func (p *TCPProxy) Proxy(w io.Writer, r io.ReadCloser, msg *proto.ControlMessage) {
-	switch msg.Protocol {
-	case proto.TCP, proto.TCP4, proto.TCP6:
+	switch msg.ForwardedProto {
+	case proto.TCP, proto.TCP4, proto.TCP6, proto.UNIX:
 		// ok
 	default:
 		p.logger.Log(
@@ -76,7 +68,7 @@ func (p *TCPProxy) Proxy(w io.Writer, r io.ReadCloser, msg *proto.ControlMessage
 		return
 	}
 
-	target := p.localAddrFor(msg.ForwardedBy)
+	target := p.localAddrFor(msg.ForwardedHost)
 	if target == "" {
 		p.logger.Log(
 			"level", 1,
@@ -97,11 +89,22 @@ func (p *TCPProxy) Proxy(w io.Writer, r io.ReadCloser, msg *proto.ControlMessage
 		)
 		return
 	}
+	defer local.Close()
+
+	if err := keepAlive(local); err != nil {
+		p.logger.Log(
+			"level", 1,
+			"msg", "TCP keepalive for tunneled connection failed",
+			"target", target,
+			"ctrlMsg", msg,
+			"err", err,
+		)
+	}
 
 	done := make(chan struct{})
 	go func() {
 		transfer(flushWriter{w}, local, log.NewContext(p.logger).With(
-			"dst", msg.ForwardedBy,
+			"dst", msg.ForwardedHost,
 			"src", target,
 		))
 		close(done)
@@ -109,14 +112,14 @@ func (p *TCPProxy) Proxy(w io.Writer, r io.ReadCloser, msg *proto.ControlMessage
 
 	transfer(local, r, log.NewContext(p.logger).With(
 		"dst", target,
-		"src", msg.ForwardedBy,
+		"src", msg.ForwardedHost,
 	))
 
 	<-done
 }
 
 func (p *TCPProxy) localAddrFor(hostPort string) string {
-	if p.localAddrMap == nil {
+	if len(p.localAddrMap) == 0 {
 		return p.localAddr
 	}
 

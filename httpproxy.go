@@ -1,5 +1,5 @@
 // Copyright (C) 2017 Michał Matczuk
-// Use of this source code is governed by a BSD-style
+// Use of this source code is governed by an AGPL-style
 // license that can be found in the LICENSE file.
 
 package tunnel
@@ -7,7 +7,6 @@ package tunnel
 import (
 	"bufio"
 	"context"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -24,7 +23,7 @@ type HTTPProxy struct {
 	httputil.ReverseProxy
 	// localURL specifies default base URL of local service.
 	localURL *url.URL
-	// localURLMap specifies mapping from ControlMessage ForwardedBy to
+	// localURLMap specifies mapping from ControlMessage.ForwardedHost to
 	// local service URL, keys may contain host and port, only host or
 	// only port. The order of precedence is the following
 	// * host and port
@@ -38,10 +37,6 @@ type HTTPProxy struct {
 // NewHTTPProxy creates a new direct HTTPProxy, everything will be proxied to
 // localURL.
 func NewHTTPProxy(localURL *url.URL, logger log.Logger) *HTTPProxy {
-	if localURL == nil {
-		panic("empty localURL")
-	}
-
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -58,10 +53,6 @@ func NewHTTPProxy(localURL *url.URL, logger log.Logger) *HTTPProxy {
 // NewMultiHTTPProxy creates a new dispatching HTTPProxy, requests may go to
 // different backends based on localURLMap.
 func NewMultiHTTPProxy(localURLMap map[string]*url.URL, logger log.Logger) *HTTPProxy {
-	if localURLMap == nil {
-		panic("empty localURLMap")
-	}
-
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -77,7 +68,10 @@ func NewMultiHTTPProxy(localURLMap map[string]*url.URL, logger log.Logger) *HTTP
 
 // Proxy is a ProxyFunc.
 func (p *HTTPProxy) Proxy(w io.Writer, r io.ReadCloser, msg *proto.ControlMessage) {
-	if msg.Protocol != proto.HTTP {
+	switch msg.ForwardedProto {
+	case proto.HTTP, proto.HTTPS:
+		// ok
+	default:
 		p.logger.Log(
 			"level", 0,
 			"msg", "unsupported protocol",
@@ -88,7 +82,11 @@ func (p *HTTPProxy) Proxy(w io.Writer, r io.ReadCloser, msg *proto.ControlMessag
 
 	rw, ok := w.(http.ResponseWriter)
 	if !ok {
-		panic(fmt.Sprintf("Expected http.ResponseWriter got %T", w))
+		p.logger.Log(
+			"level", 0,
+			"msg", "expected http.ResponseWriter",
+			"ctrlMsg", msg,
+		)
 	}
 
 	req, err := http.ReadRequest(bufio.NewReader(r))
@@ -101,7 +99,9 @@ func (p *HTTPProxy) Proxy(w io.Writer, r io.ReadCloser, msg *proto.ControlMessag
 		)
 		return
 	}
-	req.URL.Host = msg.ForwardedBy
+
+	setXForwardedFor(req.Header, msg.RemoteAddr)
+	req.URL.Host = msg.ForwardedHost
 
 	p.ServeHTTP(rw, req)
 }
@@ -126,8 +126,8 @@ func (p *HTTPProxy) Director(req *http.Request) {
 		return
 	}
 
-	req.URL.Scheme = target.Scheme
 	req.URL.Host = target.Host
+	req.URL.Scheme = target.Scheme
 	req.URL.Path = singleJoiningSlash(target.Path, req.URL.Path)
 
 	targetQuery := target.RawQuery
@@ -163,7 +163,7 @@ func singleJoiningSlash(a, b string) string {
 }
 
 func (p *HTTPProxy) localURLFor(u *url.URL) *url.URL {
-	if p.localURLMap == nil {
+	if len(p.localURLMap) == 0 {
 		return p.localURL
 	}
 

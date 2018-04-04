@@ -1,5 +1,5 @@
 // Copyright (C) 2017 Michał Matczuk
-// Use of this source code is governed by a BSD-style
+// Use of this source code is governed by an AGPL-style
 // license that can be found in the LICENSE file.
 
 package id
@@ -28,25 +28,6 @@ func New(data []byte) ID {
 	hasher.Write(data)
 	hasher.Sum(id[:0])
 
-	return id
-}
-
-// NewFromString creates a new ID from the given string.
-func NewFromString(s string) ID {
-	return New([]byte(s))
-}
-
-// NewFromBytes creates a new ID with the value of the given byte slice.  The
-// given byte slice must be 32 bytes long (the same length as ID), or this
-// function will panic.
-func NewFromBytes(b []byte) ID {
-	var id ID
-
-	if len(b) != len(id) {
-		panic("invalid slice length for id")
-	}
-
-	copy(id[0:], b)
 	return id
 }
 

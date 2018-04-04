@@ -1,42 +1,28 @@
 // Copyright (C) 2017 Michał Matczuk
-// Use of this source code is governed by a BSD-style
+// Use of this source code is governed by an AGPL-style
 // license that can be found in the LICENSE file.
 
 package tunnel
 
 import (
 	"io"
+	"net"
 	"net/http"
+	"strings"
 
 	"github.com/mmatczuk/go-http-tunnel/log"
 )
 
-type closeWriter interface {
-	CloseWrite() error
-}
-
-type closeReader interface {
-	CloseRead() error
-}
-
-func transfer(dst io.Writer, src io.ReadCloser, logger log.Logger) {
+func transfer(dst io.Writer, src io.Reader, logger log.Logger) {
 	n, err := io.Copy(dst, src)
 	if err != nil {
-		logger.Log(
-			"level", 2,
-			"msg", "copy error",
-			"err", err,
-		)
-	}
-
-	if d, ok := dst.(closeWriter); ok {
-		d.CloseWrite()
-	}
-
-	if s, ok := src.(closeReader); ok {
-		s.CloseRead()
-	} else {
-		src.Close()
+		if !strings.Contains(err.Error(), "context canceled") && !strings.Contains(err.Error(), "CANCEL") {
+			logger.Log(
+				"level", 2,
+				"msg", "copy error",
+				"err", err,
+			)
+		}
 	}
 
 	logger.Log(
@@ -44,6 +30,29 @@ func transfer(dst io.Writer, src io.ReadCloser, logger log.Logger) {
 		"action", "transferred",
 		"bytes", n,
 	)
+}
+
+func setXForwardedFor(h http.Header, remoteAddr string) {
+	clientIP, _, err := net.SplitHostPort(remoteAddr)
+	if err == nil {
+		// If we aren't the first proxy retain prior
+		// X-Forwarded-For information as a comma+space
+		// separated list and fold multiple headers into one.
+		if prior, ok := h["X-Forwarded-For"]; ok {
+			clientIP = strings.Join(prior, ", ") + ", " + clientIP
+		}
+		h.Set("X-Forwarded-For", clientIP)
+	}
+}
+
+func cloneHeader(h http.Header) http.Header {
+	h2 := make(http.Header, len(h))
+	for k, vv := range h {
+		vv2 := make([]string, len(vv))
+		copy(vv2, vv)
+		h2[k] = vv2
+	}
+	return h2
 }
 
 func copyHeader(dst, src http.Header) {

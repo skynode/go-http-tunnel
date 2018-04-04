@@ -1,5 +1,5 @@
 // Copyright (C) 2017 Michał Matczuk
-// Use of this source code is governed by a BSD-style
+// Use of this source code is governed by an AGPL-style
 // license that can be found in the LICENSE file.
 
 package tunnel
@@ -7,6 +7,7 @@ package tunnel
 import (
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -17,11 +18,6 @@ import (
 
 	"github.com/mmatczuk/go-http-tunnel/log"
 	"github.com/mmatczuk/go-http-tunnel/proto"
-)
-
-var (
-	// DefaultTimeout specifies general purpose timeout.
-	DefaultTimeout = 10 * time.Second
 )
 
 // ClientConfig is configuration of the Client.
@@ -50,7 +46,8 @@ type ClientConfig struct {
 // messages. It uses ProxyFunc for transferring data between server and local
 // services.
 type Client struct {
-	config         *ClientConfig
+	config *ClientConfig
+
 	conn           net.Conn
 	connMu         sync.Mutex
 	httpServer     *http2.Server
@@ -61,18 +58,18 @@ type Client struct {
 
 // NewClient creates a new unconnected Client based on configuration. Caller
 // must invoke Start() on returned instance in order to connect server.
-func NewClient(config *ClientConfig) *Client {
+func NewClient(config *ClientConfig) (*Client, error) {
 	if config.ServerAddr == "" {
-		panic("missing ServerAddr")
+		return nil, errors.New("missing ServerAddr")
 	}
 	if config.TLSClientConfig == nil {
-		panic("missing TLSClientConfig")
+		return nil, errors.New("missing TLSClientConfig")
 	}
-	if config.Tunnels == nil || len(config.Tunnels) == 0 {
-		panic("missing Tunnels")
+	if len(config.Tunnels) == 0 {
+		return nil, errors.New("missing Tunnels")
 	}
 	if config.Proxy == nil {
-		panic("missing Proxy")
+		return nil, errors.New("missing Proxy")
 	}
 
 	logger := config.Logger
@@ -86,7 +83,7 @@ func NewClient(config *ClientConfig) *Client {
 		logger:     logger,
 	}
 
-	return c
+	return c, nil
 }
 
 // Start connects client to the server, it returns error if there is a
@@ -169,13 +166,28 @@ func (c *Client) dial() (net.Conn, error) {
 		if c.config.DialTLS != nil {
 			conn, err = c.config.DialTLS(network, addr, tlsConfig)
 		} else {
-			conn, err = tls.DialWithDialer(
-				&net.Dialer{Timeout: DefaultTimeout},
-				network, addr, tlsConfig,
-			)
+			d := &net.Dialer{
+				Timeout: DefaultTimeout,
+			}
+			conn, err = d.Dial(network, addr)
+
+			if err == nil {
+				err = keepAlive(conn)
+			}
+			if err == nil {
+				conn = tls.Client(conn, tlsConfig)
+			}
+			if err == nil {
+				err = conn.(*tls.Conn).Handshake()
+			}
 		}
 
 		if err != nil {
+			if conn != nil {
+				conn.Close()
+				conn = nil
+			}
+
 			c.logger.Log(
 				"level", 0,
 				"msg", "dial failed",
@@ -228,7 +240,7 @@ func (c *Client) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msg, err := proto.ReadControlMessage(r.Header)
+	msg, err := proto.ReadControlMessage(r)
 	if err != nil {
 		c.logger.Log(
 			"level", 1,

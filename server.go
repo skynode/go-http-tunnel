@@ -1,5 +1,5 @@
 // Copyright (C) 2017 Michał Matczuk
-// Use of this source code is governed by a BSD-style
+// Use of this source code is governed by an AGPL-style
 // license that can be found in the LICENSE file.
 
 package tunnel
@@ -28,6 +28,9 @@ type ServerConfig struct {
 	// Addr is TCP address to listen for client connections. If empty ":0"
 	// is used.
 	Addr string
+	// AutoSubscribe if enabled will automatically subscribe new clients on
+	// first call.
+	AutoSubscribe bool
 	// TLSConfig specifies the tls configuration to use with tls.Listener.
 	TLSConfig *tls.Config
 	// Listener specifies optional listener for client connections. If nil
@@ -41,7 +44,8 @@ type ServerConfig struct {
 // tunnel connection.
 type Server struct {
 	*registry
-	config     *ServerConfig
+	config *ServerConfig
+
 	listener   net.Listener
 	connPool   *connPool
 	httpClient *http.Client
@@ -52,7 +56,7 @@ type Server struct {
 func NewServer(config *ServerConfig) (*Server, error) {
 	listener, err := listener(config)
 	if err != nil {
-		return nil, fmt.Errorf("tls listener failed: %s", err)
+		return nil, fmt.Errorf("listener failed: %s", err)
 	}
 
 	logger := config.Logger
@@ -71,7 +75,12 @@ func NewServer(config *ServerConfig) (*Server, error) {
 	pool := newConnPool(t, s.disconnected)
 	t.ConnPool = pool
 	s.connPool = pool
-	s.httpClient = &http.Client{Transport: t}
+	s.httpClient = &http.Client{
+		Transport: t,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 
 	return s, nil
 }
@@ -88,7 +97,7 @@ func listener(config *ServerConfig) (net.Listener, error) {
 		return nil, errors.New("missing TLSConfig")
 	}
 
-	return tls.Listen("tcp", config.Addr, config.TLSConfig)
+	return net.Listen("tcp", config.Addr)
 }
 
 // disconnected clears resources used by client, it's invoked by connection pool
@@ -140,14 +149,23 @@ func (s *Server) Start() {
 
 			s.logger.Log(
 				"level", 0,
-				"msg", "accept control connection failed",
+				"msg", "accept of control connection failed",
 				"addr", addr,
 				"err", err,
 			)
 			continue
 		}
 
-		go s.handleClient(conn)
+		if err := keepAlive(conn); err != nil {
+			s.logger.Log(
+				"level", 0,
+				"msg", "TCP keepalive for control connection failed",
+				"addr", addr,
+				"err", err,
+			)
+		}
+
+		go s.handleClient(tls.Server(conn, s.config.TLSConfig))
 	}
 }
 
@@ -175,7 +193,7 @@ func (s *Server) handleClient(conn net.Conn) {
 		logger.Log(
 			"level", 0,
 			"msg", "invalid connection type",
-			"err", fmt.Errorf("expected tls conn, got %T", conn),
+			"err", fmt.Errorf("expected TLS conn, got %T", conn),
 		)
 		goto reject
 	}
@@ -192,7 +210,9 @@ func (s *Server) handleClient(conn net.Conn) {
 
 	logger = logger.With("identifier", identifier)
 
-	if !s.IsSubscribed(identifier) {
+	if s.config.AutoSubscribe {
+		s.Subscribe(identifier)
+	} else if !s.IsSubscribed(identifier) {
 		logger.Log(
 			"level", 2,
 			"msg", "unknown client",
@@ -399,6 +419,11 @@ func (s *Server) Unsubscribe(identifier id.ID) *RegistryItem {
 	return s.registry.Unsubscribe(identifier)
 }
 
+// Ping measures the RTT response time.
+func (s *Server) Ping(identifier id.ID) (time.Duration, error) {
+	return s.connPool.Ping(identifier)
+}
+
 func (s *Server) listen(l net.Listener, identifier id.ID) {
 	addr := l.Addr().String()
 
@@ -417,7 +442,7 @@ func (s *Server) listen(l net.Listener, identifier id.ID) {
 
 			s.logger.Log(
 				"level", 0,
-				"msg", "accept connection failed",
+				"msg", "accept of connection failed",
 				"identifier", identifier,
 				"addr", addr,
 				"err", err,
@@ -426,11 +451,21 @@ func (s *Server) listen(l net.Listener, identifier id.ID) {
 		}
 
 		msg := &proto.ControlMessage{
-			Action:       proto.ActionProxy,
-			Protocol:     l.Addr().Network(),
-			ForwardedFor: conn.RemoteAddr().String(),
-			ForwardedBy:  l.Addr().String(),
+			Action:         proto.ActionProxy,
+			ForwardedHost:  l.Addr().String(),
+			ForwardedProto: l.Addr().Network(),
 		}
+
+		if err := keepAlive(conn); err != nil {
+			s.logger.Log(
+				"level", 1,
+				"msg", "TCP keepalive for tunneled connection failed",
+				"identifier", identifier,
+				"ctrlMsg", msg,
+				"err", err,
+			)
+		}
+
 		go func() {
 			if err := s.proxyConn(identifier, conn, msg); err != nil {
 				s.logger.Log(
@@ -458,6 +493,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"level", 0,
 			"action", "round trip failed",
 			"addr", r.RemoteAddr,
+			"host", r.Host,
 			"url", r.URL,
 			"err", err,
 		)
@@ -465,46 +501,67 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
+	defer resp.Body.Close()
 
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	if resp.Body != nil {
-		transfer(w, resp.Body, log.NewContext(s.logger).With(
-			"dir", "client to user",
-			"dst", r.RemoteAddr,
-			"src", r.Host,
-		))
-	}
+
+	transfer(w, resp.Body, log.NewContext(s.logger).With(
+		"dir", "client to user",
+		"dst", r.RemoteAddr,
+		"src", r.Host,
+	))
 }
 
 // RoundTrip is http.RoundTriper implementation.
 func (s *Server) RoundTrip(r *http.Request) (*http.Response, error) {
-	msg := &proto.ControlMessage{
-		Action:       proto.ActionProxy,
-		Protocol:     proto.HTTP,
-		ForwardedFor: r.RemoteAddr,
-		ForwardedBy:  r.Host,
-	}
-
 	identifier, auth, ok := s.Subscriber(r.Host)
 	if !ok {
 		return nil, errClientNotSubscribed
 	}
+
+	outr := r.WithContext(r.Context())
+	if r.ContentLength == 0 {
+		outr.Body = nil // Issue 16036: nil Body for http.Transport retries
+	}
+	outr.Header = cloneHeader(r.Header)
+
 	if auth != nil {
 		user, password, _ := r.BasicAuth()
 		if auth.User != user || auth.Password != password {
 			return nil, errUnauthorised
 		}
-		r.Header.Del("Authorization")
+		outr.Header.Del("Authorization")
 	}
 
-	return s.proxyHTTP(identifier, r, msg)
+	setXForwardedFor(outr.Header, r.RemoteAddr)
+
+	scheme := r.URL.Scheme
+	if scheme == "" {
+		if r.TLS != nil {
+			scheme = proto.HTTPS
+		} else {
+			scheme = proto.HTTP
+		}
+	}
+	if r.Header.Get("X-Forwarded-Host") == "" {
+		outr.Header.Set("X-Forwarded-Host", r.Host)
+		outr.Header.Set("X-Forwarded-Proto", scheme)
+	}
+
+	msg := &proto.ControlMessage{
+		Action:         proto.ActionProxy,
+		ForwardedHost:  r.Host,
+		ForwardedProto: scheme,
+	}
+
+	return s.proxyHTTP(identifier, outr, msg)
 }
 
 func (s *Server) proxyConn(identifier id.ID, conn net.Conn, msg *proto.ControlMessage) error {
 	s.logger.Log(
 		"level", 2,
-		"action", "proxy",
+		"action", "proxy conn",
 		"identifier", identifier,
 		"ctrlMsg", msg,
 	)
@@ -520,6 +577,9 @@ func (s *Server) proxyConn(identifier id.ID, conn net.Conn, msg *proto.ControlMe
 		return err
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	req = req.WithContext(ctx)
+
 	done := make(chan struct{})
 	go func() {
 		transfer(pw, conn, log.NewContext(s.logger).With(
@@ -527,6 +587,7 @@ func (s *Server) proxyConn(identifier id.ID, conn net.Conn, msg *proto.ControlMe
 			"dst", identifier,
 			"src", conn.RemoteAddr(),
 		))
+		cancel()
 		close(done)
 	}()
 
@@ -534,6 +595,7 @@ func (s *Server) proxyConn(identifier id.ID, conn net.Conn, msg *proto.ControlMe
 	if err != nil {
 		return fmt.Errorf("io error: %s", err)
 	}
+	defer resp.Body.Close()
 
 	transfer(conn, resp.Body, log.NewContext(s.logger).With(
 		"dir", "client to user",
@@ -545,7 +607,7 @@ func (s *Server) proxyConn(identifier id.ID, conn net.Conn, msg *proto.ControlMe
 
 	s.logger.Log(
 		"level", 2,
-		"action", "proxy done",
+		"action", "proxy conn done",
 		"identifier", identifier,
 		"ctrlMsg", msg,
 	)
@@ -556,7 +618,7 @@ func (s *Server) proxyConn(identifier id.ID, conn net.Conn, msg *proto.ControlMe
 func (s *Server) proxyHTTP(identifier id.ID, r *http.Request, msg *proto.ControlMessage) (*http.Response, error) {
 	s.logger.Log(
 		"level", 2,
-		"action", "proxy",
+		"action", "proxy HTTP",
 		"identifier", identifier,
 		"ctrlMsg", msg,
 	)
@@ -605,7 +667,7 @@ func (s *Server) proxyHTTP(identifier id.ID, r *http.Request, msg *proto.Control
 
 	s.logger.Log(
 		"level", 2,
-		"action", "proxy done",
+		"action", "proxy HTTP done",
 		"identifier", identifier,
 		"ctrlMsg", msg,
 		"status code", resp.StatusCode,
@@ -622,7 +684,7 @@ func (s *Server) connectRequest(identifier id.ID, msg *proto.ControlMessage, r i
 	if err != nil {
 		return nil, fmt.Errorf("could not create request: %s", err)
 	}
-	msg.Update(req.Header)
+	msg.WriteToHeader(req.Header)
 
 	return req, nil
 }

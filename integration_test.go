@@ -1,5 +1,5 @@
 // Copyright (C) 2017 Michał Matczuk
-// Use of this source code is governed by a BSD-style
+// Use of this source code is governed by an AGPL-style
 // license that can be found in the LICENSE file.
 
 package tunnel_test
@@ -7,7 +7,6 @@ package tunnel_test
 import (
 	"bytes"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -16,12 +15,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/mmatczuk/go-http-tunnel"
-	"github.com/mmatczuk/go-http-tunnel/id"
+	"github.com/mmatczuk/go-http-tunnel/log"
 	"github.com/mmatczuk/go-http-tunnel/proto"
 )
 
@@ -32,13 +32,24 @@ const (
 
 // echoHTTP starts serving HTTP requests on listener l, it accepts connections,
 // reads request body and writes is back in response.
-func echoHTTP(l net.Listener) {
+func echoHTTP(t testing.TB, l net.Listener) {
 	http.Serve(l, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prior := strings.Join(r.Header["X-Forwarded-For"], ", ")
+		if len(strings.Split(prior, ",")) != 2 {
+			t.Fatal(r.Header)
+		}
+		if !strings.Contains(r.Header.Get("X-Forwarded-Host"), "localhost:") {
+			t.Fatal(r.Header)
+		}
+		if r.Header.Get("X-Forwarded-Proto") != "http" {
+			t.Fatal(r.Header)
+		}
+
 		w.WriteHeader(http.StatusOK)
 		if r.Body != nil {
 			body, err := ioutil.ReadAll(r.Body)
 			if err != nil {
-				panic(err)
+				t.Fatal(err)
 			}
 			w.Write(body)
 		}
@@ -58,7 +69,7 @@ func echoTCP(l net.Listener) {
 	}
 }
 
-func makeEcho(t *testing.T) (http net.Listener, tcp net.Listener) {
+func makeEcho(t testing.TB) (http net.Listener, tcp net.Listener) {
 	var err error
 
 	// TCP echo
@@ -73,37 +84,37 @@ func makeEcho(t *testing.T) (http net.Listener, tcp net.Listener) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go echoHTTP(http)
+	go echoHTTP(t, http)
 
 	return
 }
 
-func makeTunnelServer(t *testing.T) *tunnel.Server {
-	cert, identifier := selfSignedCert()
+func makeTunnelServer(t testing.TB) *tunnel.Server {
 	s, err := tunnel.NewServer(&tunnel.ServerConfig{
-		Addr:      ":0",
-		TLSConfig: tlsConfig(cert),
+		Addr:          ":0",
+		AutoSubscribe: true,
+		TLSConfig:     tlsConfig(),
+		Logger:        log.NewStdLogger(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Subscribe(identifier)
 	go s.Start()
 
 	return s
 }
 
-func makeTunnelClient(t *testing.T, serverAddr string, httpLocalAddr, httpAddr, tcpLocalAddr, tcpAddr net.Addr) *tunnel.Client {
+func makeTunnelClient(t testing.TB, serverAddr string, httpLocalAddr, httpAddr, tcpLocalAddr, tcpAddr net.Addr) *tunnel.Client {
 	httpProxy := tunnel.NewMultiHTTPProxy(map[string]*url.URL{
 		"localhost:" + port(httpLocalAddr): {
 			Scheme: "http",
 			Host:   "127.0.0.1:" + port(httpAddr),
 		},
-	}, nil)
+	}, log.NewStdLogger())
 
 	tcpProxy := tunnel.NewMultiTCPProxy(map[string]string{
 		port(tcpLocalAddr): tcpAddr.String(),
-	}, nil)
+	}, log.NewStdLogger())
 
 	tunnels := map[string]*proto.Tunnel{
 		proto.HTTP: {
@@ -117,17 +128,24 @@ func makeTunnelClient(t *testing.T, serverAddr string, httpLocalAddr, httpAddr, 
 		},
 	}
 
-	cert, _ := selfSignedCert()
-	c := tunnel.NewClient(&tunnel.ClientConfig{
+	c, err := tunnel.NewClient(&tunnel.ClientConfig{
 		ServerAddr:      serverAddr,
-		TLSClientConfig: tlsConfig(cert),
+		TLSClientConfig: tlsConfig(),
 		Tunnels:         tunnels,
 		Proxy: tunnel.Proxy(tunnel.ProxyFuncs{
 			HTTP: httpProxy.Proxy,
 			TCP:  tcpProxy.Proxy,
 		}),
+		Logger: log.NewStdLogger(),
 	})
-	go c.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		if err := c.Start(); err != nil {
+			t.Log(err)
+		}
+	}()
 
 	return c
 }
@@ -186,7 +204,7 @@ func TestIntegration(t *testing.T) {
 	wg.Wait()
 }
 
-func testHTTP(t *testing.T, addr net.Addr, payload []byte, repeat uint) {
+func testHTTP(t testing.TB, addr net.Addr, payload []byte, repeat uint) {
 	url := fmt.Sprintf("http://localhost:%s/some/path", port(addr))
 
 	for repeat > 0 {
@@ -203,9 +221,6 @@ func testHTTP(t *testing.T, addr net.Addr, payload []byte, repeat uint) {
 		if resp.StatusCode != http.StatusOK {
 			t.Error("Unexpected status code", resp)
 		}
-		if resp.Body == nil {
-			t.Error("No body")
-		}
 		b, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
 			t.Error("Read error")
@@ -218,7 +233,7 @@ func testHTTP(t *testing.T, addr net.Addr, payload []byte, repeat uint) {
 	}
 }
 
-func testTCP(t *testing.T, addr net.Addr, payload []byte, repeat uint) {
+func testTCP(t testing.TB, addr net.Addr, payload []byte, repeat uint) {
 	conn, err := net.Dial("tcp", addr.String())
 	if err != nil {
 		t.Fatal("Dial failed", err)
@@ -300,23 +315,15 @@ func port(addr net.Addr) string {
 	return fmt.Sprint(addr.(*net.TCPAddr).Port)
 }
 
-func selfSignedCert() (tls.Certificate, id.ID) {
+func tlsConfig() *tls.Config {
 	cert, err := tls.LoadX509KeyPair("./testdata/selfsigned.crt", "./testdata/selfsigned.key")
 	if err != nil {
 		panic(err)
 	}
-	x509Cert, err := x509.ParseCertificate(cert.Certificate[0])
-	if err != nil {
-		panic(err)
-	}
 
-	return cert, id.New(x509Cert.Raw)
-}
-
-func tlsConfig(cert tls.Certificate) *tls.Config {
 	c := &tls.Config{
 		Certificates:             []tls.Certificate{cert},
-		ClientAuth:               tls.RequestClientCert,
+		ClientAuth:               tls.RequireAnyClientCert,
 		SessionTicketsDisabled:   true,
 		InsecureSkipVerify:       true,
 		MinVersion:               tls.VersionTLS12,

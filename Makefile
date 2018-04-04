@@ -4,8 +4,12 @@ all: clean check test
 clean:
 	@go clean -r
 
+.PHONY: fmt
+fmt:
+	@go fmt ./...
+
 .PHONY: check
-check: .check-fmt .check-vet .check-lint .check-ineffassign .check-mega .check-misspell
+check: .check-fmt .check-vet .check-lint .check-ineffassign .check-mega .check-misspell .check-vendor
 
 .PHONY: .check-fmt
 .check-fmt:
@@ -34,6 +38,10 @@ check: .check-fmt .check-vet .check-lint .check-ineffassign .check-mega .check-m
 .check-mega:
 	@megacheck ./...
 
+.PHONY: .check-vendor
+.check-vendor:
+	@dep ensure -no-vendor -dry-run
+
 .PHONY: test
 test:
 	@echo "==> Running tests (race)..."
@@ -59,8 +67,8 @@ get-tools:
 
 #OUTPUT_DIR = build
 #OS = "darwin freebsd linux windows"
-#ARCH = "amd64 arm"
-#OSARCH = "!darwin/arm !windows/arm"
+#ARCH = "386 amd64 arm"
+#OSARCH = "!darwin/386 !darwin/arm !windows/arm"
 #GIT_COMMIT = $(shell git describe --always)
 #
 #.PHONY: release
@@ -69,7 +77,7 @@ get-tools:
 #.PHONY: build
 #build:
 #	mkdir ${OUTPUT_DIR}
-#	GOARM=5 gox -ldflags "-X main.version=$(GIT_COMMIT)" \
+#	CGO_ENABLED=0 GOARM=5 gox -ldflags "-w -X main.version=$(GIT_COMMIT)" \
 #	-os=${OS} -arch=${ARCH} -osarch=${OSARCH} -output "${OUTPUT_DIR}/pkg/{{.OS}}_{{.Arch}}/{{.Dir}}" \
 #	./cmd/tunnel ./cmd/tunneld
 #
